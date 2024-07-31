@@ -8,7 +8,6 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig, AdamW, get_scheduler
 from tqdm import tqdm
 from datasets import load_dataset
-from PIL import Image
 from torch.utils.data import Dataset
 
 
@@ -131,14 +130,13 @@ def train_model(rank, world_size, model_path, processor, data, epochs=10, lr=1e-
 
 # Main function to launch training
 def main():
-    model_path = "/home/NASynology/Datasets/datasets/Models/florence-2-large-ft"
+    model_path = "microsoft/Florence-2-large-ft"
     # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
     # Load the dataset
-    data_dir = "/home/NASynology/Datasets/datasets/Datasets/DocumentVQA"
+    data_dir = "HuggingFaceM4/DocumentVQA"
     data = load_dataset(data_dir)
-
 
 
     world_size = torch.cuda.device_count()
