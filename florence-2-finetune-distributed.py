@@ -10,20 +10,37 @@ from tqdm import tqdm
 from datasets import load_dataset
 from torch.utils.data import Dataset
 
+# -----------------------------------------------------------------------------
+# DDP training guide:
+# 1. Initialize the Process Group:
+# Set up the distributed environment and initialize the process group.
 
-# Initialize the process group
+# 2. Wrap the Model:
+# Use torch.nn.parallel.DistributedDataParallel to wrap your model.
+
+# 3. Use Distributed Data Loaders:
+# Adjust the data loaders to use DistributedSampler for distributed training.
+
+# 4. Launch Training Script:
+# Use the torch.multiprocessing.spawn to launch multiple processes for training.
+# -----------------------------------------------------------------------------
+
+
+# For 1: Initialize the process group
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    print(f"Process {rank} initialized, PID: {os.getpid()}")
+    torch.cuda.set_device(rank)
 
-# Create the model
+# For 2: Create the model
 def create_model(rank, model_path):
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).to(rank)
     model = DDP(model, device_ids=[rank])
     return model
 
-# Define the dataset class
+# For 3: Define the dataset class
 class DocVQADataset(Dataset):
     def __init__(self, data):
         self.data = data
@@ -40,33 +57,42 @@ class DocVQADataset(Dataset):
             image = image.convert("RGB")
         return question, first_answer, image
 
-# Create data loaders
+# For 3: Create data loaders
 def create_data_loaders(rank, world_size, processor, data, batch_size, num_workers):
     # Collate function for data loader
     def collate_fn(batch):
+        # Extract questions, answers, and images from the batch
         questions, answers, images = zip(*batch)
+        # Use the processor to prepare the text and image data
         inputs = processor(text=list(questions), images=list(images), return_tensors="pt", padding=True)
         return inputs, answers
     
     train_dataset = DocVQADataset(data['train'])
     val_dataset = DocVQADataset(data['validation'])
-    
+
+    # Create distributed samplers
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
-    
+
+    # Create data loaders with the custom collate function
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, collate_fn=collate_fn, num_workers=num_workers)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, collate_fn=collate_fn, num_workers=num_workers)
     
     return train_loader, val_loader
 
+
 # Training loop
 def train_model(rank, world_size, model_path, processor, data, epochs=10, lr=1e-6, batch_size=1, num_workers=0):
+    # 1. Initialize the Process Group:
     setup(rank, world_size)
-    
+    # 2. Wrap the Model:
     model = create_model(rank, model_path)
+    # 3. Use Distributed Data Loaders:
     train_loader, val_loader = create_data_loaders(rank, world_size, processor, data, batch_size, num_workers)
     
+    # Define optimizer
     optimizer = AdamW(model.parameters(), lr=lr)
+    # Define learning scheduler
     num_training_steps = epochs * len(train_loader)
     lr_scheduler = get_scheduler(
         name="linear",
@@ -75,6 +101,7 @@ def train_model(rank, world_size, model_path, processor, data, epochs=10, lr=1e-
         num_training_steps=num_training_steps,
     )
 
+    # Training
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -83,6 +110,7 @@ def train_model(rank, world_size, model_path, processor, data, epochs=10, lr=1e-
 
             input_ids = inputs["input_ids"].to(rank)
             pixel_values = inputs["pixel_values"].to(rank)
+             # Tokenize the answers for labels
             labels = processor.tokenizer(text=answers, return_tensors="pt", padding=True, return_token_type_ids=False).input_ids.to(rank)
 
             outputs = model(input_ids=input_ids, pixel_values=pixel_values, labels=labels)
@@ -132,13 +160,15 @@ def train_model(rank, world_size, model_path, processor, data, epochs=10, lr=1e-
 def main():
     model_path = "microsoft/Florence-2-large-ft"
     # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+    # consistent preprocessing across all processes in DDP training.
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
     # Load the dataset
     data_dir = "HuggingFaceM4/DocumentVQA"
     data = load_dataset(data_dir)
 
-
+    # 4. Launch Training Script:
     world_size = torch.cuda.device_count()
     mp.spawn(train_model,
              args=(world_size, model_path, processor, data),
